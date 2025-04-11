@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$ApplicationInsightsApiKey = $Env:Deployment_Telemetry_Instrumentation_Key,
     [string]$Edition = $Env:SonarQubeEdition,
     [string]$Version = $Env:SonarQubeVersion
@@ -53,6 +53,37 @@ function TrackTimedEvent {
     }
 }
 
+function ParseLatestVersionUrlFromSonarSourceHtml {
+    param (
+        [string]$Html,
+        [string]$FileNamePrefix
+    )
+
+    # Match each relevant zip line and extract timestamp and URL
+    $pattern = @"
+    (?<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z)\s+\S+\s+<a href="(?<url>https://[^"]+?$FileNamePrefix[^"]+?\.zip)"
+"@
+
+    $zipRegex = [regex]::new($pattern)
+    $matches = $zipRegex.Matches($Html)
+
+    # Parse matches into objects
+    $releases = foreach ($match in $matches) {
+        [PSCustomObject]@{
+            Timestamp = [datetime]::Parse($match.Groups['timestamp'].Value)
+            Url       = $match.Groups['url'].Value
+        }
+    }
+
+    # Select the latest based on timestamp
+    $latest = $releases | Sort-Object Timestamp -Descending | Select-Object -First 1
+
+    return $latest.Url
+}
+
+$env:Edition = 'Developer'
+$env:Version = 'Latest'
+
 TrackTimedEvent -InstrumentationKey $ApplicationInsightsApiKey -EventName 'Download And Extract Binaries' -ScriptBlock {
     Write-Output 'Copy wwwroot folder'
     xcopy wwwroot ..\wwwroot /YI
@@ -62,14 +93,6 @@ TrackTimedEvent -InstrumentationKey $ApplicationInsightsApiKey -EventName 'Downl
     Write-Output 'Prevent the progress meter from trying to access the console'
     $global:progressPreference = 'SilentlyContinue'
 
-    if (!$Version -or ($Version -ieq 'Latest')) {
-        # binaries.sonarsource.com moved to S3 and is not easily searchable anymore. Getting the latest version from GitHub releases.
-        $releasesFromApi = (Invoke-WebRequest -Uri 'https://api.github.com/repos/SonarSource/sonarqube/releases' -UseBasicParsing).Content
-        $releasesPS = $releasesFromApi | ConvertFrom-Json
-        $Version = $releasesPS.Name | ForEach-Object { if ($_) { [version]$_ } } | Sort-Object -Descending | Select-Object -First 1
-        Write-Output "Found the latest release to be $Version"
-    }
-
     if (!$Edition) {
         $Edition = 'Community'
     }
@@ -78,6 +101,7 @@ TrackTimedEvent -InstrumentationKey $ApplicationInsightsApiKey -EventName 'Downl
     $fileNamePrefix = 'sonarqube' # Community Edition
     switch ($Edition) {
         'Developer' {
+            Write-Output 'Using Developer edition'
             $downloadFolder = 'CommercialDistribution/sonarqube-developer'
             $fileNamePrefix = 'sonarqube-developer'
         }
@@ -93,6 +117,17 @@ TrackTimedEvent -InstrumentationKey $ApplicationInsightsApiKey -EventName 'Downl
 
     $fileName = "$fileNamePrefix-$Version.zip"
     $downloadUri = "https://binaries.sonarsource.com/$downloadFolder/$fileName"
+
+    if (!$Version -or ($Version -ieq 'Latest')) {
+        Write-Output 'Searching for latest version'
+        $sonarSourceUrl = "https://binaries.sonarsource.com/?prefix=$downloadFolder" # The problem here is that this page runs javascript which fetches the list of versions it loads in the HTML
+        Write-Output "Loading $sonarSourceUrl"
+        $sonarSourceHtml = (Invoke-WebRequest -Uri $sonarSourceUrl -UseBasicParsing).Content
+        Write-Output "HTML: $sonarSourceHtml"
+        $downloadUri = ParseLatestVersionUrlFromSonarSourceHtml -Html $sonarSourceHtml -FileNamePrefix $fileNamePrefix
+        $fileName = [System.IO.Path]::GetFileName($downloadUri)
+        Write-Output "Found latest version at $downloadUri"
+    }
 
     if (!$downloadUri -or !$fileName) {
         throw 'Could not get download uri or filename.'
